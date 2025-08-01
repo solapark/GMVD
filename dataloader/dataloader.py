@@ -9,7 +9,7 @@ import torch
 from torchvision.transforms import ToTensor
 
 class GetDataset(VisionDataset):
-    def __init__(self, base, reID=False, train=True, transform=ToTensor(), target_transform=ToTensor(),grid_reduce=4, img_reduce=4, train_ratio=0.9):
+    def __init__(self, base, reID=False, train=True, transform=ToTensor(), target_transform=ToTensor(),grid_reduce=4, img_reduce=4, train_ratio=0.9, fix_extrinsic_matrices=True):
         # parameters in super can be accessed as (self.param) eg:- self.transform, self.target_transform
         super().__init__(base.root, transform=transform, target_transform=target_transform)
         self.base = base
@@ -52,6 +52,7 @@ class GetDataset(VisionDataset):
         self.gt_map = {}
         self.download(frame_range)
 
+        self.fix_extrinsic_matrices = fix_extrinsic_matrices
 
     def download(self, frame_range):
         for fname in sorted(os.listdir(os.path.join(self.root, 'annotations_positions'))):
@@ -87,7 +88,10 @@ class GetDataset(VisionDataset):
             map_gt = (map_gt > 0).int()
         if self.target_transform is not None:
             map_gt = self.target_transform(map_gt)
-        return imgs, map_gt.float(), frame
+
+        extrinsic_matrices = None if self.fix_extrinsic_matrices else self.base.extrinsic_matrices[frame]
+        data = [imgs, extrinsic_matrices]
+        return data, map_gt.float(), frame
     
     def __len__(self):
         # length of dataset

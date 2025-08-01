@@ -17,6 +17,7 @@ import torch.optim as optim
 import torchvision.transforms as T
 from dataloader.wildtrack import Wildtrack
 from dataloader.multiviewx import MultiviewX
+from dataloader.messytable import Messytable
 from dataloader.dataloader import GetDataset
 from utils.logger import Logger
 from utils.utils import loss_curve, nms, AverageMeter
@@ -79,7 +80,7 @@ def train(model, epoch, data_loader, optimizer, log_interval, scheduler=None):
         #if not args.avgpool:
             #print('Duplicate cam : ', duplicate_cam)
     for batch_idx, (data, map_gt, _) in enumerate(data_loader):
-        data = data.to(device)
+        data[0] = data[0].to(device)
         optimizer.zero_grad()
         map_res = model(data, ignore_cam, duplicate_cam,args.dropview, args.train_cam)
         loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
@@ -126,7 +127,7 @@ def test(model, epoch, data_loader, res_fpath=None, visualize=False):
     accuracy_s = AverageMeter()
     all_res_list = []
     for batch_idx, (data, map_gt, frame) in enumerate(data_loader):
-        data = data.to(device)
+        data[0] = data[0].to(device)
         
         with torch.no_grad():
             map_res = model(data, 0, 0, False, args.test_cam)
@@ -135,12 +136,17 @@ def test(model, epoch, data_loader, res_fpath=None, visualize=False):
             map_grid_res = map_res.detach().cpu().squeeze()
             v_s = map_grid_res[map_grid_res > args.cls_thres].unsqueeze(1)
             grid_ij = torch.nonzero(map_grid_res > args.cls_thres)
+            imgs_xywh = torch.load('%s/%08d.pt'%(args.xywh_dir, frame[0]))
+            imgH, imgW = map_grid_res.shape
+            xywhs = imgs_xywh[0].reshape(imgH, imgW, -1)[map_grid_res > args.cls_thres].cpu().detach()
             if data_loader.dataset.base.indexing == 'xy':
                 grid_xy = grid_ij[:, [1, 0]]
             else:
                 grid_xy = grid_ij
+
             all_res_list.append(torch.cat([torch.ones_like(v_s) * frame, grid_xy.float() *
-                                           data_loader.dataset.grid_reduce, v_s], dim=1))
+                                           data_loader.dataset.grid_reduce, v_s, xywhs], dim=1))
+                                           #data_loader.dataset.grid_reduce, v_s], dim=1))
             
         loss = criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel)
         losses += loss.item()
@@ -159,8 +165,10 @@ def test(model, epoch, data_loader, res_fpath=None, visualize=False):
         precision_s.update(precision)
         recall_s.update(recall)
         accuracy_s.update(accuracy)
+        #break
 
     if visualize and epoch!=0:
+    #if visualize :
         fig = plt.figure()
         subplt0 = fig.add_subplot(211, title="output")
         subplt1 = fig.add_subplot(212, title="target")
@@ -176,9 +184,12 @@ def test(model, epoch, data_loader, res_fpath=None, visualize=False):
         res_list = []
         for frame in np.unique(all_res_list[:, 0]):
             res = all_res_list[all_res_list[:, 0] == frame, :]
-            positions, scores = res[:, 1:3], res[:, 3]
+            positions, scores, whs = res[:, 1:3], res[:, 3], res[:, 4:]
+            #positions, scores = res[:, 1:3], res[:, 3]
             ids, count = nms(positions, scores, 20, np.inf)
-            res_list.append(torch.cat([torch.ones([count, 1]) * frame, positions[ids[:count], :]], dim=1))
+            positions, whs = positions.to(torch.int), whs.to(torch.int)
+            res_list.append(torch.cat([torch.ones([count, 1]) * frame, positions[ids[:count], :], whs[ids[:count], :]], dim=1))
+            #res_list.append(torch.cat([torch.ones([count, 1]) * frame, positions[ids[:count], :]], dim=1))
         res_list = torch.cat(res_list, dim=0).numpy() if res_list else np.empty([0, 3])
         np.savetxt(res_fpath, res_list, '%d')
         
@@ -201,13 +212,13 @@ def test(model, epoch, data_loader, res_fpath=None, visualize=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Multiview detector')
     parser.add_argument('--cls_thres', type=float, default=0.4)
-    parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx'], help='Choose dataset wildtrack/multiviewx (default: wildtrack)')
+    parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'messytable'], help='Choose dataset wildtrack/multiviewx/messytable (default: wildtrack)')
     parser.add_argument('-l', '--loss', type=str, default='klcc', choices=['klcc', 'mse'], help='Choose loss function klcc/mse. (default:klcc)' )
     parser.add_argument('-pr', '--pretrained', default=True, action='store_true', help='Use pretrained weights (default: True)')
     parser.add_argument('-cd', '--cross_dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx'])
     parser.add_argument('-j', '--num_workers', type=int, default=4)
     parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N', help='input batch size for training (default: 2)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: 10)')
+    parser.add_argument('--epochs', type=int, default=80, metavar='N', help='number of epochs to train (default: 10)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='LR', help='learning rate (default: 1e-3)')
     parser.add_argument('--max_lr', type=float, default=1e-2, metavar='max LR', help=' max learning rate (default: 1e-2)')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
@@ -228,6 +239,9 @@ if __name__ == '__main__':
     parser.add_argument("--train_cam", nargs="+", default=[])
     parser.add_argument("--test_cam", nargs="+", default=[])
     parser.add_argument('--dropview', default=False, action='store_true', help='Enable drop view training(default: False)')
+    parser.add_argument('--train_ratio', type=float, default=.9, help='train/test raito(messytable : .5026)')
+    parser.add_argument('--var_extrinsic_matrices', action='store_true', help='variable extrinsic matrices at scene by scene (messyTable: False)')
+    parser.add_argument('--xywh_dir', type=str, default=None)
     args = parser.parse_args()
     
     torch.cuda.empty_cache()
@@ -285,18 +299,21 @@ if __name__ == '__main__':
     train_transform = T.Compose([T.Resize([720, 1280]), T.ToTensor(), normalize])
     
     if 'wildtrack' in args.dataset:
-        data_path = os.path.expanduser('./Wildtrack')
+        data_path = os.path.expanduser('/home/sapark/Data/Wildtrack')
         base = Wildtrack(data_path, args.cam_set, args.train_cam, args.test_cam)
     elif 'multiviewx' in args.dataset:
-        data_path = os.path.expanduser('./MultiviewX')
+        data_path = os.path.expanduser('/home/sapark/Data/MultiviewX')
         base = MultiviewX(data_path, args.cam_set, args.train_cam, args.test_cam)
+    elif 'messytable' in args.dataset:
+        data_path = os.path.expanduser('/home/sapark/Data/Messytable')
+        base = Messytable(data_path, args.cam_set, args.train_cam, args.test_cam)
     else:
-        raise Exception('must choose from [wildtrack, multiviewx]')
+        raise Exception('must choose from [wildtrack, multiviewx, messytable]')
         
     
     # Train and Test set
-    train_dataset = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4)
-    test_dataset = GetDataset(base, train=False, transform=train_transform, grid_reduce=4, img_reduce=4)
+    train_dataset = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=args.train_ratio, fix_extrinsic_matrices=not args.var_extrinsic_matrices)
+    test_dataset = GetDataset(base, train=False, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=args.train_ratio, fix_extrinsic_matrices=not args.var_extrinsic_matrices)
     
     # Train and Test Data Loader
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
@@ -402,4 +419,4 @@ if __name__ == '__main__':
     test(model, 1, test_loader, os.path.join(logdir, 'test_'+str(args.dataset)+'.txt'), visualize=True)
     moda, modp, precision, recall = score[idx]
     print(f'####### moda: {moda:.1f}%, modp: {modp:.1f}%, prec: {precision:.1f}%, recall: {recall:.1f}% #######')
-    cleanup(logdir, idx)
+    #cleanup(logdir, idx)

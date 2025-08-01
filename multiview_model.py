@@ -20,15 +20,25 @@ class MultiView_Detection(nn.Module):
         
         self.upsample_shape = list(map(lambda x: int(x / dataset.img_reduce), self.img_shape))
         img_reduce = np.array(self.img_shape) / np.array(self.upsample_shape)
-        img_zoom_mat = np.diag(np.append(img_reduce, [1]))
-        map_zoom_mat = np.diag(np.append(np.ones([2]) / dataset.grid_reduce, [1]))
-        imgcoord2worldgrid_matrices = self.get_imgcoord2worldgrid_matrices(dataset.base.intrinsic_matrices,
-                                                                           dataset.base.extrinsic_matrices,
-                                                                           dataset.base.worldgrid2worldcoord_mat)
+        #img_zoom_mat = np.diag(np.append(img_reduce, [1]))
+        #map_zoom_mat = np.diag(np.append(np.ones([2]) / dataset.grid_reduce, [1]))
+        #imgcoord2worldgrid_matrices = self.get_imgcoord2worldgrid_matrices(dataset.base.intrinsic_matrices,
+        #                                                                   dataset.base.extrinsic_matrices,
+        #                                                                   dataset.base.worldgrid2worldcoord_mat)
         # Projection matrix
-        self.proj_mats = [torch.from_numpy(map_zoom_mat @ imgcoord2worldgrid_matrices[cam] @ img_zoom_mat)
-                          for cam in range(self.num_cam)]
-        
+        #self.proj_mats = [torch.from_numpy(map_zoom_mat @ imgcoord2worldgrid_matrices[cam] @ img_zoom_mat)
+        #                  for cam in range(self.num_cam)]
+ 
+        self.img_zoom_mat = np.diag(np.append(img_reduce, [1]))
+        self.map_zoom_mat = np.diag(np.append(np.ones([2]) / dataset.grid_reduce, [1]))
+
+        self.intrinsic_matrices = dataset.base.intrinsic_matrices
+        self.worldgrid2worldcoord_mat = dataset.base.worldgrid2worldcoord_mat
+
+        self.fix_extrinsic_matrices = dataset.fix_extrinsic_matrices
+        if self.fix_extrinsic_matrices : 
+            self.proj_mats = self.get_proj_mats(dataset.base.extrinsic_matrices)
+       
         # Coordinate Map
         self.coord_map = self.get_coord_map(self.reducedgrid_shape + [1])
         
@@ -63,7 +73,11 @@ class MultiView_Detection(nn.Module):
                                                 nn.Conv2d(512, 1, 3, padding=4, dilation=4, bias=False))#.to('cuda:0')
 
         
-    def forward(self, imgs, ignore_cam, duplicate_cam, random, cam_selected):
+    #def forward(self, imgs, ignore_cam, duplicate_cam, random, cam_selected):
+    def forward(self, data, ignore_cam, duplicate_cam, random, cam_selected):
+        imgs, extrinsic_matrices = data
+        proj_mats = self.proj_mats[cam] if self.fix_extrinsic_matrices else self.get_proj_mats(extrinsic_matrices[0])
+
         B, N, C, H, W = imgs.shape
         if random: 
             if len(cam_selected)==0: 
@@ -101,7 +115,7 @@ class MultiView_Detection(nn.Module):
             #print(cam)
             img_feature = self.base_arch(imgs[:, cam])
             #img_feature = self.base_pt2(img_feature.to('cuda:0'))
-            img_feature = F.interpolate(img_feature, self.upsample_shape, mode='bilinear')
+            img_feature = F.interpolate(img_feature, self.upsample_shape, mode='bilinear', align_corners=True)
             
             '''
             fig = plt.figure()
@@ -112,11 +126,12 @@ class MultiView_Detection(nn.Module):
             '''
 
             # 3x3 proj mat of cam --> repeat will make it [B,3,3]
-            proj_mat = self.proj_mats[cam].repeat([B, 1, 1]).float().to(device)
+            #proj_mat = self.proj_mats[cam].repeat([B, 1, 1]).float().to(device)
+            proj_mat = proj_mats[cam].repeat([B, 1, 1]).float().to(device)
             if  self.avgpool:
-                world_feature = kornia.warp_perspective(img_feature, proj_mat, self.reducedgrid_shape).unsqueeze(0)
+                world_feature = kornia.geometry.transform.warp_perspective(img_feature, proj_mat, self.reducedgrid_shape).unsqueeze(0)
             else:
-                world_feature = kornia.warp_perspective(img_feature, proj_mat, self.reducedgrid_shape)
+                world_feature = kornia.geometry.transform.warp_perspective(img_feature, proj_mat, self.reducedgrid_shape)
             ######### Concetenate features ###########
             world_features.append(world_feature)
             ##########################################
@@ -145,7 +160,7 @@ class MultiView_Detection(nn.Module):
         
         
         map_result = self.map_classifier(world_features)
-        map_result = F.interpolate(map_result, self.reducedgrid_shape, mode='bilinear')
+        map_result = F.interpolate(map_result, self.reducedgrid_shape, mode='bilinear', align_corners=True)
         return map_result
             
     def get_imgcoord2worldgrid_matrices(self, intrinsic_matrices, extrinsic_matrices, worldgrid2worldcoord_mat):
@@ -172,3 +187,11 @@ class MultiView_Detection(nn.Module):
         ret = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0)
         return ret
         
+    def get_proj_mats(self, extrinsic_matrices) :
+        imgcoord2worldgrid_matrices = self.get_imgcoord2worldgrid_matrices(self.intrinsic_matrices,
+                                                                           np.array(extrinsic_matrices.detach().cpu()),
+                                                                           self.worldgrid2worldcoord_mat)
+        proj_mats = [torch.from_numpy(self.map_zoom_mat @ imgcoord2worldgrid_matrices[cam] @ self.img_zoom_mat)
+                          for cam in range(self.num_cam)]
+        return proj_mats
+
